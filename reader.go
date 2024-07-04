@@ -39,6 +39,9 @@ type ReaderConfig struct {
 
 	// Advanced parameters.
 	Advanced AdvancedReaderConfig
+
+	// Optional token range for stream filtering
+	TokenRange *TokenRange
 }
 
 func (rc *ReaderConfig) validate() error {
@@ -135,6 +138,11 @@ type AdvancedReaderConfig struct {
 	ChangeAgeLimit time.Duration
 }
 
+// TokenRange contains bengin and end tokens for stream filtering
+type TokenRange struct {
+	Begin, End int64
+}
+
 func (arc *AdvancedReaderConfig) setDefaults() {
 	setIfZero := func(p *time.Duration, v time.Duration) {
 		if *p == 0 {
@@ -188,6 +196,7 @@ func NewReader(ctx context.Context, config *ReaderConfig) (*Reader, error) {
 	genFetcher, err := newGenerationFetcher(
 		config.Session,
 		readFrom,
+		config.TokenRange,
 		config.Logger,
 	)
 	if err != nil {

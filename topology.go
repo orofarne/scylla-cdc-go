@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -15,6 +16,7 @@ import (
 var (
 	ErrNoGenerationsPresent               = errors.New("there are no generations present")
 	ErrNoSupportedGenerationTablesPresent = errors.New("no supported generation tables are present")
+	ErrNotSupportedTokenRange             = errors.New("not supported token range")
 )
 
 const (
@@ -73,9 +75,10 @@ type generationFetcher struct {
 func newGenerationFetcher(
 	session *gocql.Session,
 	startFrom time.Time,
+	tokenRange *TokenRange,
 	logger Logger,
 ) (*generationFetcher, error) {
-	source, err := chooseGenerationSource(session, logger)
+	source, err := chooseGenerationSource(session, tokenRange, logger)
 	if err != nil {
 		return nil, fmt.Errorf("failed to detect version of the generation tables used by the cluster: %v", err)
 	}
@@ -94,7 +97,7 @@ func newGenerationFetcher(
 	return gf, nil
 }
 
-func chooseGenerationSource(session *gocql.Session, logger Logger) (generationSource, error) {
+func chooseGenerationSource(session *gocql.Session, tokenRange *TokenRange, logger Logger) (generationSource, error) {
 	hasPre4_4, err := isTableInSchema(session, generationsTableNamePre4_4)
 	if err != nil {
 		return nil, err
@@ -113,8 +116,9 @@ func chooseGenerationSource(session *gocql.Session, logger Logger) (generationSo
 		// There is only 4.4+ table, we can immediately start
 		// using the new table
 		return &generationSourceSince4_4{
-			session: session,
-			logger:  logger,
+			session:    session,
+			tokenRange: tokenRange,
+			logger:     logger,
 		}, nil
 	}
 
@@ -369,11 +373,23 @@ func (gs *generationSourcePre4_4) maybeUpgrade() (generationSource, error) {
 }
 
 type generationSourceSince4_4 struct {
-	session *gocql.Session
-	logger  Logger
+	session    *gocql.Session
+	tokenRange *TokenRange
+	logger     Logger
 }
 
 func (gs *generationSourceSince4_4) getGeneration(genTime time.Time, consistency gocql.Consistency) ([]StreamID, error) {
+	if gs.tokenRange != nil {
+		if gs.tokenRange.Begin >= gs.tokenRange.End {
+			return nil, ErrNotSupportedTokenRange
+		}
+		return gs.getGenerationWithRange(genTime, consistency)
+	} else {
+		return gs.getGenerationWithoutRange(genTime, consistency)
+	}
+}
+
+func (gs *generationSourceSince4_4) getGenerationWithoutRange(genTime time.Time, consistency gocql.Consistency) ([]StreamID, error) {
 	var streams []StreamID
 	iter := gs.session.Query("SELECT streams FROM "+streamsTableSince4_4+" WHERE time = ?", genTime).
 		Consistency(consistency).
@@ -382,6 +398,32 @@ func (gs *generationSourceSince4_4) getGeneration(genTime time.Time, consistency
 	var vnodeStreams []StreamID
 	for iter.Scan(&vnodeStreams) {
 		streams = append(streams, vnodeStreams...)
+	}
+
+	if err := iter.Close(); err != nil {
+		return nil, err
+	}
+	return streams, nil
+}
+
+func (gs *generationSourceSince4_4) getGenerationWithRange(genTime time.Time, consistency gocql.Consistency) ([]StreamID, error) {
+	var streams []StreamID
+
+	query := "SELECT range_end, streams FROM " + streamsTableSince4_4 + " WHERE time = ? AND range_end >= ? ORDER BY range_end"
+
+	iter := gs.session.Query(query, genTime, gs.tokenRange.Begin).
+		Consistency(consistency).
+		Iter()
+
+	var rangeEnd int64
+	var vnodeStreams []StreamID
+
+	prevRangeEnd := int64(math.MinInt64)
+	for iter.Scan(&rangeEnd, &vnodeStreams) {
+		if prevRangeEnd < gs.tokenRange.End {
+			streams = append(streams, vnodeStreams...)
+		}
+		prevRangeEnd = rangeEnd
 	}
 
 	if err := iter.Close(); err != nil {
